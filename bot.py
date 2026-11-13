@@ -10,12 +10,24 @@
   TESTS_URL    адрес файла с тестами (tests.html)
   CHANNEL_ID   id закрытого канала, например -1001234567890. Бот должен быть админом канала
   ADMIN_ID     твой Telegram id: присланное тобой видео бот вернёт как file_id
+  PORT         порт веб-сервера для мини-аппа (по умолчанию 8080)
+  ALLOW_ORIGIN откуда разрешены запросы мини-аппа к серверу (по умолчанию *;
+               если приложение на GitHub Pages, укажи https://имя.github.io)
+
+Веб-сервер отдаёт мини-аппу /api/me (есть ли подписка) и, если рядом лежат
+index.html и bgm.mp3, сам раздаёт приложение по адресу /.
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
-from urllib.parse import urlencode
+import time
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -44,6 +56,9 @@ WEBAPP_URL = os.environ["WEBAPP_URL"]
 TESTS_URL = os.environ["TESTS_URL"]
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+PORT = int(os.environ.get("PORT", "8080"))
+ALLOW_ORIGIN = os.environ.get("ALLOW_ORIGIN", "*")
+BASE = Path(__file__).resolve().parent
 PAY_TEXT = "У вас закончилась подписка. Чтобы оплатить, перейдите в @habirov_cyrcle_bot"
 
 dp = Dispatcher()
@@ -167,10 +182,79 @@ async def get_file_id(message: Message) -> None:
     await message.answer(f"file_id:\n<code>{f.file_id}</code>", parse_mode="HTML")
 
 
+# ---------- веб-часть для мини-аппа: статус подписки ----------
+def check_init_data(init_data: str, max_age: int = 86400):
+    """Проверяет подпись Telegram. Возвращает данные пользователя или None.
+    Так id человека нельзя подделать в браузере."""
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        if not got:
+            return None
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > max_age:
+            return None
+        return json.loads(pairs["user"])
+    except Exception:
+        return None
+
+
+_sub_cache: dict = {}
+
+
+@web.middleware
+async def cors(request, handler):
+    resp = web.Response(status=204) if request.method == "OPTIONS" else await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = ALLOW_ORIGIN
+    resp.headers["Access-Control-Allow-Headers"] = "X-Init-Data, Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return resp
+
+
+async def api_me(request: web.Request) -> web.Response:
+    user = check_init_data(request.headers.get("X-Init-Data", ""))
+    if not user:
+        return web.json_response({"ok": False}, status=401)
+    uid = user["id"]
+    hit = _sub_cache.get(uid)
+    if hit and time.time() - hit[0] < 60:
+        return web.json_response({"ok": True, "active": hit[1]})
+    res = await is_member(request.app["bot"], uid)  # True / False / None
+    if res is None:  # Telegram не ответил: не кэшируем, считаем «не знаем»
+        return web.json_response({"ok": False}, status=503)
+    _sub_cache[uid] = (time.time(), bool(res))
+    return web.json_response({"ok": True, "active": bool(res)})
+
+
+def static(f: Path, headers: dict):
+    async def handler(request: web.Request) -> web.StreamResponse:
+        return web.FileResponse(f, headers=headers)
+    return handler
+
+
+def make_web(bot: Bot) -> web.Application:
+    app = web.Application(middlewares=[cors])
+    app["bot"] = bot
+    app.add_routes([web.get("/api/me", api_me)])
+    for route, name, extra in (("/", "index.html", {"Cache-Control": "no-cache"}), ("/index.html", "index.html", {"Cache-Control": "no-cache"}), ("/bgm.mp3", "bgm.mp3", {})):
+        f = BASE / name
+        if f.exists():  # раздаём только эти два файла, не всю папку
+            app.add_routes([web.get(route, static(f, extra))])
+    return app
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     bot = Bot(BOT_TOKEN)
     await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Круг", web_app=WebAppInfo(url=WEBAPP_URL)))
+    runner = web.AppRunner(make_web(bot))
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    logging.info("Веб-сервер мини-аппа на порту %s", PORT)
     await dp.start_polling(bot)
 
 
